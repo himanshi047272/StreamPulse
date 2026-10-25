@@ -1,0 +1,450 @@
+/* StreamPulse front-end: hash-routed single page app (no external libraries). */
+const $ = (s, r = document) => r.querySelector(s);
+const esc = Charts.esc;
+const S = { page: "dashboard", res: null, st: null, cfg: null, evalModel: null, evalSplit: "test", metricSplit: "test",
+            fcTab: "both", xaiRec: 0, preview: {}, busy: false };
+const COLORS = ["#3b6cf6", "#2fc58a", "#ff9b21", "#8a5cf5", "#f0566a", "#14b8d4"];
+const SHORT = { "Logistic Regression": "LogReg", "Linear Discriminant": "LDA", "Naive Bayes": "NB", "K-Nearest Neighbors": "KNN", "SVM (RBF)": "SVM", "Neural Network (MLP)": "MLP" };
+const short = n => SHORT[n] || n;
+const pct = (v, d = 1) => v == null ? "—" : (v * 100).toFixed(d) + "%";
+const f4 = v => v == null ? "—" : Number(v).toFixed(4);
+const num = v => v == null ? "—" : Number(v).toLocaleString();
+
+const I = {
+  dashboard: '<rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/>',
+  run: '<path d="M12 16V4m0 0-4 4m4-4 4 4"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/>',
+  models: '<circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M8 7.5l3 8M16 7.5l-3 8M8.5 6h7"/>',
+  evaluation: '<path d="M9 11l3 3 8-8"/><path d="M20 12v7a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h9"/>',
+  xai: '<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3M11 8v6M8 11h6"/>',
+  forecast: '<path d="M3 17l6-6 4 4 8-8"/><path d="M15 7h6v6"/>',
+  retention: '<path d="M12 21s-7-4.5-7-10a4 4 0 0 1 7-2.6A4 4 0 0 1 19 11c0 5.5-7 10-7 10z"/>',
+  outputs: '<path d="M14 3H6a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8z"/><path d="M14 3v5h5M9 13h6M9 17h6"/>'
+};
+const svg = (k, w = 18) => `<svg viewBox="0 0 24 24" width="${w}" height="${w}">${I[k]}</svg>`;
+const PAGES = [["dashboard", "Dashboard"], ["run", "Data & Run"], ["models", "Models"], ["evaluation", "Evaluation"],
+               ["xai", "Explainability"], ["forecast", "Forecasting"], ["retention", "Retention"], ["outputs", "CSV Outputs"]];
+
+/* ───────── helpers ───────── */
+const api = async (url, opt) => { const r = await fetch(url, opt); const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || r.statusText); return j; };
+function toast(msg, ms = 3200) { const t = $("#toast"); t.textContent = msg; t.hidden = false; clearTimeout(toast.t); toast.t = setTimeout(() => t.hidden = true, ms); }
+const running = () => S.st && S.st.state === "running";
+const empty = (title, sub, btn = true) => `<div class="card empty"><b>${title}</b>${sub}${btn ? `<div style="margin-top:14px"><a class="btn" href="#run">Go to Data &amp; Run</a></div>` : ""}</div>`;
+const head = (h, p, right = "") => `<div class="head"><div><h1>${h}</h1><p>${p}</p></div>${right}</div>`;
+const greeting = () => { const h = new Date().getHours(); return h < 12 ? "Good morning" : h < 17 ? "Good afternoon" : "Good evening"; };
+const best = () => S.res && S.res.models.find(m => m.is_best);
+const hasTest = () => S.res && S.res.meta.test_has_labels;
+const mcolor = n => COLORS[Math.max(0, S.res.models.findIndex(m => m.name === n)) % COLORS.length];
+
+/* ───────── navigation ───────── */
+function buildNav() {
+  $("#nav").innerHTML = PAGES.map(([k, l]) => `<a data-page="${k}" href="#${k}">${svg(k)}<span>${l}</span></a>`).join("");
+}
+function go() {
+  S.page = (location.hash || "#dashboard").slice(1);
+  if (!PAGES.some(p => p[0] === S.page)) S.page = "dashboard";
+  document.querySelectorAll("#nav a").forEach(a => a.classList.toggle("active", a.dataset.page === S.page));
+  $("#sidebar").classList.remove("open");
+  render();
+}
+function render() {
+  const fn = { dashboard, run: runPage, models: modelsPage, evaluation: evalPage, xai: xaiPage, forecast: forecastPage, retention: retentionPage, outputs: outputsPage }[S.page];
+  const y = window.scrollY;
+  $("#view").innerHTML = fn();
+  if (S.page === "run") bindRun();
+  if (S.page === "retention") bindPredict();
+  if (S.page === "outputs") bindOutputs();
+  window.scrollTo(0, y);
+}
+
+/* ───────── DASHBOARD ───────── */
+function kpi(color, icon, label, value, sub, delta = "") {
+  return `<div class="card kpi"><div class="ico" style="background:${color}">${icon}</div><div><small>${label}</small><div class="v">${value}${delta}</div><div class="s">${sub}</div></div></div>`;
+}
+const KI = {
+  users: '<svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><path d="M16 4.5a3.5 3.5 0 0 1 0 7M18 14a6 6 0 0 1 3.5 6"/></svg>',
+  churn: '<svg viewBox="0 0 24 24"><path d="M3 17l6-6 4 4 8-8"/><path d="M15 7h6v6"/></svg>',
+  check: '<svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>',
+  alert: '<svg viewBox="0 0 24 24"><path d="M12 3l10 18H2z"/><path d="M12 10v5M12 18v.01"/></svg>'
+};
+function dashboard() {
+  const r = S.res, st = S.st || { steps: [], models: [] };
+  const b = r && best();
+  let k;
+  if (r) {
+    const m = r.meta, t = b.test || b.val, tn = r.retention.n, atr = r.retention.risk_counts;
+    k = [kpi("#3b6cf6", KI.users, "Customers analysed", num(m.n_train + m.n_val + m.n_test), `${num(m.n_train)} train · ${num(m.n_val)} val · ${num(m.n_test)} test`),
+         kpi("#ff9b21", KI.churn, "Churn rate", pct(m.churn_rate), "train file overall"),
+         kpi("#2fc58a", KI.check, b.test ? "Best model · test F1" : "Best model · val F1", pct(t.f1), esc(b.name)),
+         kpi("#8a5cf5", KI.alert, "High-risk customers", num(atr.High), `of ${num(tn)} scored (${pct(atr.High / Math.max(tn, 1), 0)})`)];
+  } else {
+    k = [kpi("#3b6cf6", KI.users, "Customers analysed", "—", "waiting for a run"), kpi("#ff9b21", KI.churn, "Churn rate", "—", "waiting for a run"),
+         kpi("#2fc58a", KI.check, "Best model", "—", "waiting for a run"), kpi("#8a5cf5", KI.alert, "High-risk customers", "—", "waiting for a run")];
+  }
+  const chip = r ? `<div class="chip">📅 ${esc(r.meta.app_run_at)} · ${esc(r.meta.train_name)}</div>` : `<div class="chip">No run yet</div>`;
+  const banner = !r && !running() ? `<div class="note info" style="margin-bottom:16px"><b>Welcome!</b> Upload your Netflix churn CSV(s) on <a class="link" href="#run">Data &amp; Run</a> — or tick “use built-in sample” — to train, validate and test 6 models.</div>` : "";
+
+  /* model progress */
+  let prog;
+  if (running() || !r) {
+    const names = st.models.length ? st.models : ["Logistic Regression", "Linear Discriminant", "Naive Bayes", "K-Nearest Neighbors", "SVM (RBF)", "Neural Network (MLP)"].map(n => ({ name: n, pct: 0, status: "queued" }));
+    prog = names.map((m, i) => progRow(m.name, m.pct, COLORS[i % 6], m.status));
+  } else prog = r.models.map((m, i) => progRow(m.name, m.val.roc_auc, COLORS[i % 6], "val AUC", true));
+  const title = r && !running() ? "Model Leaderboard" : "Training Progress";
+
+  /* risk donut */
+  let don;
+  if (r) {
+    const c = r.retention.risk_counts, tot = c.High + c.Medium + c.Low;
+    don = Charts.donut([{ value: c.High, color: "#f0566a" }, { value: c.Medium, color: "#ff9b21" }, { value: c.Low, color: "#3b6cf6" }], num(tot), "Scored customers") +
+      `<div class="legend" style="flex-direction:column;gap:9px;margin-top:14px">${[["High risk", c.High, "#f0566a"], ["Medium risk", c.Medium, "#ff9b21"], ["Low risk", c.Low, "#3b6cf6"]].map(([l, v, col]) => `<span class="row-split" style="width:100%"><span><i style="background:${col}"></i> ${l}</span><b>${num(v)}</b></span>`).join("")}</div>`;
+  } else don = Charts.donut([], "—", "No data yet") + `<p class="empty" style="padding:14px 0 0">Run the pipeline to see churn risk.</p>`;
+
+  /* pipeline timeline */
+  const phases = [["train", "Train", "#3b6cf6"], ["validate", "Validate", "#8a5cf5"], ["test", "Test file", "#ff9b21"], ["explain", "Explain & forecast", "#2fc58a"]];
+  const tl = phases.map(([p, l, col]) => {
+    const ss = st.steps.filter(s => s.phase === p), d = ss.filter(s => s.status === "done").length, secs = ss.reduce((a, s) => a + (s.secs || 0), 0);
+    return `<div class="tl-i"><span class="tl-dot" style="background:${col}"></span><div><b>${l}</b><small>${ss.length ? `${d}/${ss.length} steps` : "—"}</small></div><span class="tl-r">${d === ss.length && ss.length ? secs.toFixed(1) + "s" : ss.some(s => s.status === "running") ? "running…" : ""}</span></div>`;
+  }).join("");
+
+  /* models list + metric bars */
+  const mlist = r ? r.models.slice(0, 5).map((m, i) => `<div class="mrow"><div class="mav" style="background:${COLORS[i % 6]}">${short(m.name).slice(0, 3).toUpperCase()}</div><div><b>${esc(m.name)}</b><small>${esc(m.family)}</small></div><span class="pill ${m.is_best ? "green" : "blue"}">${m.is_best ? "Best" : "#" + m.rank}</span></div>`).join("") : `<div class="empty">Models appear here after a run.</div>`;
+  const splitSel = r ? `<select id="msplit"><option value="val" ${S.metricSplit === "val" ? "selected" : ""}>Validation</option>${hasTest() ? `<option value="test" ${S.metricSplit === "test" ? "selected" : ""}>Test</option>` : ""}</select>` : "";
+  let chart = `<div class="empty">Run the pipeline to compare models.</div>`;
+  if (r) {
+    const sp = S.metricSplit === "test" && hasTest() ? "test" : "val";
+    chart = Charts.groupedBars(r.models.map(m => short(m.name)), [["precision", "Precision", "#3b6cf6"], ["recall", "Recall", "#8cb0ff"], ["f1", "F1", "#2fc58a"]].map(([k, n, c]) => ({ name: n, color: c, values: r.models.map(m => m[sp][k]) })), { pct: true, min: 0, max: 1 }) +
+      `<div class="legend"><span><i style="background:#3b6cf6"></i>Precision</span><span><i style="background:#8cb0ff"></i>Recall</span><span><i style="background:#2fc58a"></i>F1</span></div>`;
+  }
+  return `${head(`${greeting()}, Himanshi! 👋`, "Here’s what’s happening with your churn models today.", chip)}${banner}
+  <div class="grid g4">${k.join("")}</div>
+  <div class="grid g3">
+    <div class="card"><div class="card-h"><h3>${title}</h3><a class="link" href="#models">View All →</a></div>${prog.join("")}</div>
+    <div class="card"><div class="card-h"><h3>Risk Overview</h3></div>${don}</div>
+    <div class="card"><div class="card-h"><h3>Pipeline Timeline</h3><a class="link" href="#run">Open →</a></div><div class="tl">${tl}</div>
+      ${r ? `<div class="note info" style="margin-top:16px;font-size:12px">Finished in <b>${r.meta.seconds}s</b>. Test set: ${r.meta.test_from_file ? "your uploaded test file" : "hold-out split"}.</div>` : ""}</div>
+  </div>
+  <div class="grid g2">
+    <div class="card"><div class="card-h"><h3>Models</h3><a class="link" href="#models">View All →</a></div>${mlist}</div>
+    <div class="card"><div class="card-h"><h3>Metric Comparison</h3>${splitSel}</div>${chart}</div>
+  </div>
+  <div class="card"><div class="card-h"><h3>▮ Pipeline Board</h3><a class="link" href="#run">View Full Run →</a></div>${kanban(st.steps)}</div>`;
+}
+function progRow(name, val, color, status, isAuc) {
+  const w = isAuc ? Math.round(val * 100) : val, lab = isAuc ? w + "%" : (status === "done" ? "100%" : status === "queued" ? "—" : w + "%");
+  return `<div class="prow"><div class="pico" style="background:${color}22;color:${color}">${isAuc ? "★" : status === "done" ? "✓" : "◔"}</div><div class="pmain"><b>${esc(name)}</b><div class="bar"><i style="width:${w}%;background:${color}"></i></div></div><span class="pval">${lab}</span></div>`;
+}
+function kanban(steps) {
+  const cols = [["train", "To Train", "k0"], ["validate", "Validate", "k1"], ["test", "Test", "k2"], ["explain", "Explain & Forecast", "k3"]];
+  const ss = steps.length ? steps : [];
+  if (!ss.length) return `<div class="empty">Pipeline steps appear here once you start a run.</div>`;
+  return `<div class="kanban">${cols.map(([p, l, cl]) => {
+    const items = ss.filter(s => s.phase === p);
+    return `<div class="kcol ${cl}"><h5>${l} <em>${items.length}</em></h5>${items.map(s => `<div class="kcard"><span class="stat ${s.status}">${s.status === "done" ? "✓" : ""}</span><div><b>${esc(s.title)}</b><span class="tag ${s.status}">${s.status === "pending" ? "Pending" : s.status === "running" ? "Running" : "Done"}</span>${s.secs != null ? `<small>${s.secs}s</small>` : ""}${s.detail ? `<div class="fx" style="margin-top:4px">${esc(s.detail)}</div>` : ""}</div></div>`).join("")}</div>`;
+  }).join("")}</div>`;
+}
+
+/* ───────── DATA & RUN ───────── */
+function runPage() {
+  const st = S.st || { steps: [], logs: [], progress: 0 }, d = S.cfg ? S.cfg.defaults : { val_size: .2, horizon: 12, explain_n: 40 };
+  const libs = S.cfg ? S.cfg.libs : {};
+  const missing = ["shap", "lime", "statsmodels"].filter(k => libs[k] === false);
+  const r = S.res;
+  return `${head("Data & Run", "Upload your Netflix churn data, then train → validate → test.")}
+  ${missing.length ? `<div class="note bad" style="margin-bottom:16px"><b>Missing packages:</b> ${missing.join(", ")}. Run <span class="mono">pip install -r requirements.txt</span> and restart the app.</div>` : ""}
+  <div class="grid g2e">
+    <div class="card"><div class="card-h"><h3>1 · Dataset</h3></div>
+      <div class="field" style="margin-bottom:14px"><label>Train file (required) — must contain a <span class="mono">churned</span> column</label>
+        <label class="drop" id="dropTrain"><b>Drop Netflix train CSV here or click to browse</b>e.g. netflix_customer_churn.csv<div class="fn" id="fnTrain"></div><input type="file" id="fTrain" accept=".csv" hidden></label></div>
+      <div class="field" style="margin-bottom:14px"><label>Test file (optional)</label>
+        <label class="drop" id="dropTest"><b>Drop test CSV here or click to browse</b>Leave empty and 15% of the train file is held out as the test set<div class="fn" id="fnTest"></div><input type="file" id="fTest" accept=".csv" hidden></label></div>
+      <label class="check"><input type="checkbox" id="useSample"> Use built-in sample data (synthetic, Netflix schema)</label>
+      <p class="fx" style="margin-top:8px">Sample CSVs: <a class="link" href="/api/sample/train">train</a> · <a class="link" href="/api/sample/test">test</a></p></div>
+    <div class="card"><div class="card-h"><h3>2 · Settings</h3></div>
+      <div class="form-grid">
+        <div class="field"><label>Validation share of train file</label><select id="oVal"><option value="0.15">15%</option><option value="0.2" selected>20%</option><option value="0.25">25%</option><option value="0.3">30%</option></select></div>
+        <div class="field"><label>Forecast horizon (periods)</label><input type="number" id="oHor" value="${d.horizon}" min="3" max="36"></div>
+        <div class="field"><label>Records explained (SHAP/LIME)</label><input type="number" id="oExp" value="${d.explain_n}" min="10" max="150"></div>
+        <div class="field"><label>Models</label><input value="6 (no tree ensembles)" disabled></div>
+      </div>
+      <div class="note info" style="margin:16px 0;font-size:12px;line-height:1.55"><b>Flow:</b> clean → engineer features (fit on train only) → scale → SMOTE (train only) → <b>train</b> 6 models → <b>validate</b> &amp; tune each threshold → pick best → <b>run on test file</b> → metrics → SHAP + LIME → ARIMA + SARIMA → 3 CSVs.</div>
+      <button class="btn" id="runBtn" ${running() ? "disabled" : ""}>${running() ? "Running…" : "▶ Run pipeline"}</button>
+      <span id="runMsg" class="fx" style="margin-left:10px"></span></div>
+  </div>
+  ${st.state === "error" ? `<div class="note bad" style="margin-bottom:16px"><b>Run failed:</b> ${esc(st.error)}</div>` : ""}
+  <div class="card" style="margin-bottom:16px"><div class="card-h"><h3>Pipeline Board</h3><span id="runPill" class="pill ${st.state === "done" ? "green" : st.state === "running" ? "blue" : "gray"}">${st.state === "running" ? st.progress + "% · " + st.elapsed + "s" : st.state || "idle"}</span></div><div id="board">${kanban(st.steps)}</div></div>
+  <div class="grid g2e">
+    <div class="card"><div class="card-h"><h3>Live log</h3></div><div class="log" id="log">${esc((st.logs || []).join("\n")) || "Waiting for a run…"}</div></div>
+    <div class="card"><div class="card-h"><h3>Dataset summary</h3></div>${r ? summary(r.meta) : `<div class="empty">Summary appears after a run.</div>`}</div>
+  </div>`;
+}
+function summary(m) {
+  const row = (a, b) => `<tr><td>${a}</td><td class="num"><b>${b}</b></td></tr>`;
+  return `<table class="tbl"><tbody>${row("Train file", esc(m.train_name))}${row("Test file", esc(m.test_name || "—"))}${row("Rows → train / validation / test", `${num(m.n_train)} / ${num(m.n_val)} / ${num(m.n_test)}`)}
+  ${row("Churn rate (train / val / test)", `${pct(m.churn_train)} / ${pct(m.churn_val)} / ${m.churn_test == null ? "n/a" : pct(m.churn_test)}`)}${row("Duplicates removed", m.duplicates_removed)}
+  ${row("SMOTE", m.smote ? `applied (${num(m.n_train)} → ${num(m.n_train_balanced)})${m.smote_lib ? "" : " · built-in"}` : "not needed")}${row("Features kept / dropped", `${m.features.length} / ${m.dropped.length}`)}${row("Run time", m.seconds + " s")}</tbody></table>`;
+}
+function bindRun() {
+  const wire = (dropId, inputId, fnId) => {
+    const d = $(dropId), inp = $(inputId);
+    inp.onchange = () => $(fnId).textContent = inp.files[0] ? "📄 " + inp.files[0].name : "";
+    ["dragover", "dragenter"].forEach(e => d.addEventListener(e, ev => { ev.preventDefault(); d.classList.add("over"); }));
+    ["dragleave", "drop"].forEach(e => d.addEventListener(e, () => d.classList.remove("over")));
+    d.addEventListener("drop", ev => { ev.preventDefault(); if (ev.dataTransfer.files[0]) { inp.files = ev.dataTransfer.files; inp.onchange(); } });
+  };
+  wire("#dropTrain", "#fTrain", "#fnTrain"); wire("#dropTest", "#fTest", "#fnTest");
+  $("#runBtn").onclick = async () => {
+    const fd = new FormData(), sample = $("#useSample").checked;
+    if (sample) fd.append("use_sample", "1");
+    else {
+      if (!$("#fTrain").files[0]) return toast("Choose a train CSV or tick “use built-in sample”.");
+      fd.append("train_csv", $("#fTrain").files[0]);
+      if ($("#fTest").files[0]) fd.append("test_csv", $("#fTest").files[0]);
+    }
+    fd.append("val_size", $("#oVal").value); fd.append("horizon", $("#oHor").value); fd.append("explain_n", $("#oExp").value);
+    try { await api("/api/run", { method: "POST", body: fd }); startPolling(); }
+    catch (e) { toast(e.message, 5000); }
+  };
+  const lg = $("#log"); if (lg) lg.scrollTop = lg.scrollHeight;
+}
+
+/* ───────── MODELS ───────── */
+function modelsPage() {
+  if (!S.res) return head("Models", "Leaderboard of the 6 classifiers.") + empty("No models yet", "Run the pipeline to train and validate models.");
+  const r = S.res, T = hasTest();
+  const rows = r.models.map(m => `<tr class="${m.is_best ? "best" : ""}"><td>${m.rank}</td><td><b>${esc(m.name)}</b> ${m.is_best ? '<span class="pill green" style="margin-left:6px">Best</span>' : ""}</td><td>${esc(m.family)}</td>
+    <td class="num">${f4(m.val.roc_auc)}</td><td class="num">${f4(m.val.f1)}</td>${T ? `<td class="num">${f4(m.test.roc_auc)}</td><td class="num">${f4(m.test.f1)}</td><td class="num">${f4(m.test.accuracy)}</td>` : ""}<td class="num">${m.threshold}</td><td class="num">${m.train_seconds}s</td></tr>`).join("");
+  const curves = r.models.map((m, i) => ({ name: m.name, color: COLORS[i % 6], pts: (T ? m.test_roc : m.val_roc), bold: m.is_best }));
+  return `${head("Models", `6 classifiers trained on the train split, ranked by <b>validation ROC-AUC</b>. Thresholds are tuned on validation, then applied unchanged to the test file.`)}
+  <div class="card" style="margin-bottom:16px"><div class="card-h"><h3>Leaderboard</h3></div><div class="scroll"><table class="tbl"><thead><tr><th>#</th><th>Model</th><th>Family</th><th class="num">Val AUC</th><th class="num">Val F1</th>${T ? '<th class="num">Test AUC</th><th class="num">Test F1</th><th class="num">Test Acc</th>' : ""}<th class="num">Threshold</th><th class="num">Train time</th></tr></thead><tbody>${rows}</tbody></table></div></div>
+  <div class="grid g2e"><div class="card"><div class="card-h"><h3>ROC curves · ${T ? "test" : "validation"}</h3></div>${Charts.roc(curves)}<div class="legend">${curves.map(c => `<span><i style="background:${c.color}"></i>${esc(short(c.name))}</span>`).join("")}</div></div>
+  <div class="card"><div class="card-h"><h3>About the models</h3></div>${r.models.map((m, i) => `<div class="mrow"><div class="mav" style="background:${COLORS[i % 6]}">${short(m.name).slice(0, 3).toUpperCase()}</div><div><b>${esc(m.name)}</b><small>${esc(m.desc)}</small></div></div>`).join("")}
+  <div class="note info" style="margin-top:14px;font-size:12px">Tree-based models (Random Forest, boosting) are intentionally excluded.</div></div></div>`;
+}
+
+/* ───────── EVALUATION ───────── */
+function cmHtml(m) {
+  return `<div class="cm"><div class="h"></div><div class="h">Predicted: stay</div><div class="h">Predicted: churn</div>
+  <div class="h">Actual: stay</div><div class="tn">${num(m.tn)}<small>TN</small></div><div class="fp">${num(m.fp)}<small>FP</small></div>
+  <div class="h">Actual: churn</div><div class="fn">${num(m.fn)}<small>FN</small></div><div class="tp">${num(m.tp)}<small>TP</small></div></div>`;
+}
+function evalPage() {
+  if (!S.res) return head("Evaluation", "Metrics & formulas.") + empty("Nothing to evaluate yet", "Run the pipeline first.");
+  const r = S.res, T = hasTest();
+  if (!S.evalModel || !r.models.find(m => m.name === S.evalModel)) S.evalModel = best().name;
+  if (S.evalSplit === "test" && !T) S.evalSplit = "val";
+  const m = r.models.find(x => x.name === S.evalModel), sp = S.evalSplit, M = m[sp], plug = r.evaluation.plug[m.name][sp];
+  const rows = r.evaluation.cls_formulas.map(f => `<tr><td><b>${f.name}</b><div class="fx">${f.note}</div></td><td class="mono">${esc(f.formula)}</td><td class="mono fx">${esc(plug[f.key])}</td><td class="num"><b>${f4(M[f.key])}</b></td></tr>`).join("");
+  const cols = [["accuracy", "Acc"], ["precision", "Prec"], ["recall", "Recall"], ["specificity", "Spec"], ["f1", "F1"], ["balanced_accuracy", "BalAcc"], ["mcc", "MCC"], ["kappa", "Kappa"], ["roc_auc", "AUC"], ["pr_auc", "PR-AUC"], ["log_loss", "LogLoss"], ["brier", "Brier"]];
+  const cmp = r.models.map(x => `<tr class="${x.name === m.name ? "best" : ""}"><td><b>${esc(x.name)}</b></td>${cols.map(([k]) => `<td class="num">${f4(x[sp][k])}</td>`).join("")}</tr>`).join("");
+  return `${head("Evaluation", "Every metric with its formula and the numbers plugged in. Metrics are computed from the confusion matrix at each model’s validation-tuned threshold.",
+    `<div style="display:flex;gap:10px;align-items:center"><select id="evModel">${r.models.map(x => `<option ${x.name === m.name ? "selected" : ""}>${esc(x.name)}</option>`).join("")}</select>
+     <div class="tabs"><button data-split="val" class="${sp === "val" ? "on" : ""}">Validation</button>${T ? `<button data-split="test" class="${sp === "test" ? "on" : ""}">Test</button>` : ""}</div></div>`)}
+  ${!T ? `<div class="note" style="margin-bottom:16px">Your test file has no churn label, so test metrics can’t be computed — only validation metrics are shown. Predictions for the test file are still in CSV 1.</div>` : ""}
+  <div class="grid g2e"><div class="card"><div class="card-h"><h3>Confusion matrix · ${sp === "val" ? "validation" : "test"}</h3><span class="pill blue">${esc(m.name)}</span></div>${cmHtml(M)}
+    <p class="fx" style="margin-top:12px">n = ${num(M.n)} · threshold = <b>${M.threshold}</b> (tuned on validation) · churn rate = ${pct((M.tp + M.fn) / M.n)}</p></div>
+  <div class="card"><div class="card-h"><h3>Headline metrics</h3></div><div class="grid g2e" style="margin:0;gap:12px">
+    ${[["Accuracy", M.accuracy, "#3b6cf6"], ["Precision", M.precision, "#8a5cf5"], ["Recall", M.recall, "#ff9b21"], ["F1 score", M.f1, "#2fc58a"], ["ROC-AUC", M.roc_auc, "#14b8d4"], ["MCC", M.mcc, "#f0566a"]].map(([l, v, c]) => `<div style="border-left:4px solid ${c};background:#f8faff;border-radius:10px;padding:10px 14px"><small class="fx">${l}</small><div style="font-size:21px;font-weight:800">${f4(v)}</div></div>`).join("")}</div></div></div>
+  <div class="card" style="margin-bottom:16px"><div class="card-h"><h3>Metrics, formulas &amp; worked numbers</h3><span class="pill blue">${esc(m.name)} · ${sp === "val" ? "validation" : "test"}</span></div><div class="scroll"><table class="tbl"><thead><tr><th>Metric</th><th>Formula</th><th>With your numbers</th><th class="num">Value</th></tr></thead><tbody>${rows}</tbody></table></div></div>
+  <div class="card"><div class="card-h"><h3>All models · ${sp === "val" ? "validation" : "test"}</h3></div><div class="scroll"><table class="tbl"><thead><tr><th>Model</th>${cols.map(([, l]) => `<th class="num">${l}</th>`).join("")}</tr></thead><tbody>${cmp}</tbody></table></div></div>`;
+}
+
+/* ───────── EXPLAINABILITY ───────── */
+function hbars(items, color, max) {
+  return items.map(i => `<div class="prow" style="padding:6px 0"><div class="pmain" style="flex:none;width:44%"><b style="margin:0;font-weight:500" title="${esc(i.feature)}">${esc(i.feature)}</b></div><div class="bar" style="flex:1;height:9px"><i style="width:${(i.mean_abs / max * 100).toFixed(1)}%;background:${color}"></i></div><span class="pval" style="width:62px;font-size:11.5px">${i.mean_abs.toFixed(3)}</span></div>`).join("");
+}
+function diverge(items) {
+  const mx = Math.max(...items.map(i => Math.abs(i.attr))) || 1;
+  return items.map(i => { const w = Math.abs(i.attr) / mx * 50, pos = i.attr > 0;
+    return `<div style="display:flex;align-items:center;gap:8px;padding:5px 0"><div style="width:42%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(i.feature)} = ${i.value}">${esc(i.feature)} <span class="fx">= ${Number(i.value).toFixed(2)}</span></div>
+    <div style="flex:1;position:relative;height:12px"><div style="position:absolute;left:50%;top:0;bottom:0;width:1px;background:#d5dbe8"></div><div style="position:absolute;height:12px;border-radius:4px;background:${pos ? "#f0566a" : "#2fc58a"};${pos ? `left:50%;width:${w}%` : `right:50%;width:${w}%`}"></div></div>
+    <span class="fx" style="width:58px;text-align:right">${i.attr > 0 ? "+" : ""}${i.attr.toFixed(3)}</span></div>`; }).join("");
+}
+function xaiPage() {
+  if (!S.res) return head("Explainability", "SHAP and LIME.") + empty("No explanations yet", "Run the pipeline to generate SHAP and LIME explanations.");
+  const x = S.res.xai, mxS = x.shap_global[0].mean_abs, mxL = x.lime_global[0].mean_abs;
+  const loc = x.local[Math.min(S.xaiRec, x.local.length - 1)];
+  return `${head("Explainability", `Why the <b>${esc(x.model)}</b> model flags customers. ${x.n_records} test customers explained (highest-risk + random sample).`)}
+  <div class="grid g4">
+    ${kpi("#3b6cf6", KI.check, "Explainer (SHAP)", esc(x.shap_kind.replace("Explainer", "")), `units: ${x.shap_units}`)}
+    ${kpi("#2fc58a", KI.users, "Records explained", x.n_records, "SHAP and LIME")}
+    ${kpi("#ff9b21", KI.churn, "Rank agreement (Spearman)", x.spearman == null ? "—" : x.spearman.toFixed(2), "SHAP vs LIME importance")}
+    ${kpi("#8a5cf5", KI.alert, "Top-5 overlap", `${x.top5_overlap} / 5`, "features in both lists")}
+  </div>
+  <div class="grid g2e">
+    <div class="card"><div class="card-h"><h3>SHAP · global importance</h3><span class="fx">mean |SHAP|</span></div>${hbars(x.shap_global.slice(0, 12), "#3b6cf6", mxS)}</div>
+    <div class="card"><div class="card-h"><h3>LIME · global importance</h3><span class="fx">mean |weight|</span></div>${hbars(x.lime_global.slice(0, 12), "#ff9b21", mxL)}</div>
+  </div>
+  <div class="card"><div class="card-h"><h3>Local explanation</h3><select id="xRec">${x.local.map((l, i) => `<option value="${i}" ${i === S.xaiRec ? "selected" : ""}>${esc(l.record_id)} · risk ${pct(l.proba, 0)}</option>`).join("")}</select></div>
+    <p class="fx" style="margin-bottom:12px">Predicted churn probability <b>${pct(loc.proba)}</b>${loc.actual == null ? "" : ` · actual: <b>${loc.actual ? "churned" : "stayed"}</b>`}. <span style="color:#f0566a">■</span> pushes toward churn · <span style="color:#2fc58a">■</span> pushes toward staying.</p>
+    <div class="grid g2e" style="margin:0"><div><h4 style="margin-bottom:8px">SHAP</h4>${diverge(loc.shap)}</div><div><h4 style="margin-bottom:8px">LIME</h4>${diverge(loc.lime)}</div></div></div>
+  <p class="fx" style="margin-top:12px">Full per-customer SHAP and LIME values are in CSV 2 (<span class="mono">${esc(S.res.outputs.xai.file)}</span>).</p>`;
+}
+
+/* ───────── FORECASTING ───────── */
+function forecastPage() {
+  if (!S.res) {
+    return head("Forecasting", "ARIMA and SARIMA.")
+      + empty("No forecast yet", "Run the pipeline to forecast the churn rate.");
+  }
+
+  const f = S.res.forecast;
+
+  if (f && f.unavailable) {
+    return head("Forecasting", "ARIMA and SARIMA.")
+      + `<div class="note info">
+          <b>Forecasting unavailable</b>
+          <p>${esc(f.error || "The forecasting models could not be fitted.")}</p>
+          <p>Classification and explainability results may still be available.</p>
+        </div>`;
+  }
+
+  const n = f.actual.length,
+        h = f.horizon,
+        [a, b, c] = f.split_sizes,
+        tab = S.fcTab;
+
+  const pad = (arr, k) => arr.concat(new Array(k).fill(null));
+  const series = [{ name: "Actual", color: "#1b2437", values: pad(f.actual, h), width: 2, dots: true }], bands = [];
+  const defs = [["arima", "ARIMA", "#3b6cf6"], ["sarima", "SARIMA", "#ff9b21"]].filter(d => tab === "both" || tab === d[0]);
+  defs.forEach(([k, nm, col]) => {
+    const m = f.models[k];
+    series.push({ name: nm, color: col, values: m.pred.concat(m.future), dash: "5 3", width: 2 });
+    bands.push({ lo: m.lo.concat(m.future_lo), hi: m.hi.concat(m.future_hi), color: col });
+  });
+  const chart = Charts.line({ labels: f.labels, series, bands, height: 320,
+    shades: [{ from: 0, to: a - 1, color: "#f6f8fc", label: "TRAIN" }, { from: a, to: a + b - 1, color: "#eaf0ff", label: "VALIDATE" }, { from: a + b, to: n - 1, color: "#fff4dd", label: "TEST" }, { from: n, to: n + h - 1, color: "#e6f8ee", label: "FORECAST" }] });
+  const mrow = (k, nm, col) => { const m = f.models[k]; const orderTxt = k === "arima" ? `(${m.order.join(",")})` : `(${m.order.join(",")})×(${m.seasonal.join(",")})`;
+    return `<tr><td><b style="color:${col}">${nm}</b> <span class="mono fx">${orderTxt}</span></td><td class="num">${f4(m.val.rmse)}</td><td class="num">${f4(m.val.mae)}</td><td class="num">${f4(m.test.rmse)}</td><td class="num">${f4(m.test.mae)}</td><td class="num">${m.test.mape.toFixed(1)}%</td><td class="num">${m.test.smape.toFixed(1)}%</td><td class="num">${f4(m.test.r2)}</td><td class="num">${f4(m.naive_test.rmse)}</td><td class="num">${m.aic.toFixed(1)}</td></tr>`; };
+  const fm = S.res.evaluation.ts_formulas;
+  const nxt = defs.map(([k, nm, col]) => `<div class="card kpi" style="padding:14px"><div class="ico" style="background:${col}">${KI.churn}</div><div><small>${nm} · next ${h} periods</small><div class="v" style="font-size:20px">${pct(Math.min(...f.models[k].future), 1)} – ${pct(Math.max(...f.models[k].future), 1)}</div><div class="s">forecast churn-rate range</div></div></div>`).join("");
+  return `${head("Forecasting", "Churn-rate forecasts with ARIMA and SARIMA: orders are chosen on the validation window, scored on the test window, then refit on all data for the future forecast.",
+    `<div class="tabs">${[["both", "Both"], ["arima", "ARIMA"], ["sarima", "SARIMA"]].map(([k, l]) => `<button data-fc="${k}" class="${tab === k ? "on" : ""}">${l}</button>`).join("")}</div>`)}
+  <div class="note ${f.kind === "cohort" ? "" : "info"}" style="margin-bottom:16px"><b>Series:</b> ${esc(f.note)} Seasonal period for SARIMA = ${f.seasonal_period}.</div>
+  <div class="card" style="margin-bottom:16px"><div class="card-h"><h3>Churn rate · actual vs forecast (95% interval)</h3></div>${chart}
+    <div class="legend"><span><i style="background:#1b2437"></i>Actual</span>${defs.map(([, nm, col]) => `<span><i style="background:${col}"></i>${nm}</span>`).join("")}</div></div>
+  <div class="grid g2e" style="grid-template-columns:repeat(${defs.length},1fr)">${nxt}</div>
+  <div class="card" style="margin-bottom:16px"><div class="card-h"><h3>Evaluation — validation &amp; test windows</h3></div><div class="scroll"><table class="tbl"><thead><tr><th>Model</th><th class="num">Val RMSE</th><th class="num">Val MAE</th><th class="num">Test RMSE</th><th class="num">Test MAE</th><th class="num">Test MAPE</th><th class="num">Test sMAPE</th><th class="num">Test R²</th><th class="num">Naive RMSE</th><th class="num">AIC</th></tr></thead><tbody>${mrow("arima", "ARIMA", "#3b6cf6")}${mrow("sarima", "SARIMA", "#ff9b21")}</tbody></table></div>
+    <p class="fx" style="margin-top:10px">“Naive RMSE” = repeating the last observed value over the test window. A useful model should beat it.</p></div>
+  <div class="card"><div class="card-h"><h3>Formulas</h3></div><div class="scroll"><table class="tbl"><tbody>${fm.map(x => `<tr><td><b>${x.name}</b></td><td class="mono">${esc(x.formula)}</td><td class="fx">${esc(x.note)}</td></tr>`).join("")}</tbody></table></div></div>`;
+}
+
+/* ───────── RETENTION ───────── */
+function retentionPage() {
+  if (!S.res) return head("Retention", "Who to target and how.") + empty("No scores yet", "Run the pipeline to score customers.");
+  const rt = S.res.retention, tot = rt.n, rc = Object.entries(rt.rec_counts), mx = Math.max(1, ...rc.map(x => x[1]));
+  const riskPill = r => `<span class="pill ${r === "High" ? "red" : r === "Medium" ? "orange" : "green"}" style="margin:0">${r}</span>`;
+  return `${head("Retention", `Scored ${num(tot)} customers from the test file with <b>${esc(S.res.meta.best)}</b> (alert threshold ${rt.threshold}).`)}
+  <div class="grid g2">
+    <div class="card"><div class="card-h"><h3>Recommended actions</h3></div>${rc.length ? rc.map(([k, v], i) => `<div style="margin-bottom:13px"><div class="row-split"><span>${esc(k)}</span><b>${num(v)}</b></div><div class="bar"><i style="width:${v / mx * 100}%;background:${COLORS[i % 6]}"></i></div></div>`).join("") : '<div class="empty">No at-risk customers.</div>'}</div>
+    <div class="card"><div class="card-h"><h3>Top 15 at-risk customers</h3></div><div class="scroll"><table class="tbl"><thead><tr><th>Customer</th><th class="num">Risk</th><th>Level</th><th>Plan</th><th class="num">Last login (d)</th><th>Recommendation</th></tr></thead><tbody>
+    ${rt.top.map(t => `<tr><td class="mono">${esc(t.record_id)}</td><td class="num"><b>${pct(t.best_proba, 0)}</b></td><td>${riskPill(t.risk_level)}</td><td>${esc(t.subscription_type ?? "—")}</td><td class="num">${t.last_login_days ?? "—"}</td><td>${esc(t.recommendation)}</td></tr>`).join("")}</tbody></table></div></div>
+  </div>
+  <div class="card"><div class="card-h"><h3>Score a single customer</h3><span class="fx">uses the best model; blank fields default to the training median</span></div>
+    <div class="form-grid" style="grid-template-columns:repeat(4,1fr)">
+      <div class="field"><label>Plan</label><select id="pSub"><option>Basic</option><option selected>Standard</option><option>Premium</option></select></div>
+      <div class="field"><label>Monthly fee ($)</label><input id="pFee" type="number" step="0.01" value="13.99"></div>
+      <div class="field"><label>Watch hours</label><input id="pWatch" type="number" value="12"></div>
+      <div class="field"><label>Days since last login</label><input id="pLogin" type="number" value="25"></div>
+      <div class="field"><label>Profiles</label><input id="pProf" type="number" value="1"></div>
+      <div class="field"><label>Age</label><input id="pAge" type="number" value="34"></div>
+      <div class="field"><label>Payment</label><select id="pPay"><option>Credit Card</option><option>Debit Card</option><option>PayPal</option><option>Gift Card</option><option>Crypto</option></select></div>
+      <div class="field" style="display:flex;align-items:flex-end"><button class="btn" id="pBtn" style="width:100%;justify-content:center">Predict churn</button></div>
+    </div><div id="pOut" style="margin-top:14px"></div></div>`;
+}
+function bindPredict() {
+  const fee = { Basic: 8.99, Standard: 13.99, Premium: 17.99 };
+  $("#pSub").onchange = () => $("#pFee").value = fee[$("#pSub").value];
+  $("#pBtn").onclick = async () => {
+    const g = id => $(id).value;
+    const body = { subscription_type: g("#pSub"), monthly_fee: g("#pFee"), watch_hours: g("#pWatch"), last_login_days: g("#pLogin"), number_of_profiles: g("#pProf"), age: g("#pAge"), payment_method: g("#pPay") };
+    try {
+      const r = await api("/api/predict", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      $("#pOut").innerHTML = `<div class="note ${r.risk === "High" ? "bad" : r.risk === "Medium" ? "" : "info"}"><b>Churn probability ${pct(r.probability)}</b> · ${r.risk} risk · ${r.at_risk ? "flagged" : "not flagged"} (threshold ${r.threshold})<br>💡 ${esc(r.recommendation)}</div>`;
+    } catch (e) { $("#pOut").innerHTML = `<div class="note bad">${esc(e.message)}</div>`; }
+  };
+}
+
+/* ───────── CSV OUTPUTS ───────── */
+function outputsPage() {
+  const meta = [["predictions", "1", "#3b6cf6", "Model predictions", "Normal outputs: churn probability and 0/1 prediction from all 6 models for the validation and test rows, plus the best model’s risk level and retention recommendation. Includes the actual label so every metric can be recomputed."],
+    ["xai", "2", "#8a5cf5", "Explainable AI (SHAP + LIME)", "Global and per-customer SHAP and LIME attributions for the best model, with feature values and direction of effect."],
+    ["forecast", "3", "#2fc58a", "Time-series forecast (ARIMA + SARIMA)", "Actual churn rate, ARIMA and SARIMA predictions with 95% intervals for the train, validation, test and future periods."]];
+  return `${head("CSV Outputs", "Three files are written to the outputs/ folder on every run.")}
+  ${meta.map(([k, n, col, t, d]) => { const o = S.res && S.res.outputs[k];
+    return `<div class="card" style="margin-bottom:16px"><div class="csvcard"><div class="csvico" style="background:${col}">${n}</div><div style="flex:1"><h3>${t}</h3><p class="fx" style="margin:4px 0 8px;line-height:1.5">${d}</p>
+      ${o ? `<div class="mono fx">${esc(o.file)} · ${num(o.rows)} rows · ${o.cols.length} columns · ${o.kb} KB</div>` : '<div class="fx">Not generated yet.</div>'}</div>
+      <div style="display:flex;gap:8px;flex-direction:column">${o ? `<a class="btn" href="/api/download/${k}">⬇ Download</a><button class="btn ghost" data-prev="${k}">Preview</button>` : ""}</div></div>
+      <div id="prev-${k}" class="scroll" style="margin-top:14px"></div></div>`; }).join("")}
+  <div class="note info"><b>Recompute metrics from the CSVs:</b> run <span class="mono">python evaluate_outputs.py</span> — it reads CSV 1 and CSV 3 and recalculates accuracy, precision, recall, F1, ROC-AUC, MAE, RMSE, MAPE … from scratch.</div>`;
+}
+function bindOutputs() {
+  document.querySelectorAll("[data-prev]").forEach(b => b.onclick = async () => {
+    const k = b.dataset.prev, box = $("#prev-" + k);
+    if (box.innerHTML) { box.innerHTML = ""; return; }
+    const p = await api("/api/preview/" + k);
+    box.innerHTML = `<table class="tbl mono"><thead><tr>${p.columns.map(c => `<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>${p.rows.map(r => `<tr>${r.map(v => `<td>${v == null ? "" : esc(typeof v === "number" ? +v.toFixed(5) : v)}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+  });
+}
+
+/* ───────── polling & global events ───────── */
+let pollTimer = null;
+async function refreshStatus() {
+  try { S.st = await api("/api/status"); } catch (e) { return; }
+  if (S.res && S.st.state === "idle") S.st.steps = S.st.steps.map(x => ({ ...x, status: "done" }));
+  $("#promoTitle").textContent = running() ? `Running… ${S.st.progress}%` : S.res ? "Re-run pipeline" : "Run the pipeline";
+  $("#promoText").textContent = running() ? "Training, validating and testing…" : S.res ? `Best: ${S.res.meta.best}` : "Train, validate and test 6 models, then explain and forecast.";
+}
+async function startPolling() {
+  clearInterval(pollTimer);
+  await refreshStatus(); render();
+  pollTimer = setInterval(async () => {
+    await refreshStatus();
+    const fin = !running();
+    if (fin) {
+      clearInterval(pollTimer);
+      if (S.st.state === "done") { S.res = await api("/api/results"); $("#bellDot").hidden = false; toast("✅ Pipeline finished — 3 CSV files are ready."); await refreshStatus(); }
+      else if (S.st.state === "error") toast("Run failed: " + S.st.error, 6000);
+    }
+    if (S.page === "run" && !fin) updateLive();
+    else if (S.page === "run" || S.page === "dashboard" || fin) render();
+  }, 1000);
+}
+function updateLive() { /* while running, refresh only the live parts so form inputs stay intact */
+  const st = S.st; if (!st) return;
+  const lg = $("#log"); if (lg) { lg.textContent = st.logs.join("\n"); lg.scrollTop = lg.scrollHeight; }
+  const b = $("#board"); if (b) b.innerHTML = kanban(st.steps);
+  const p = $("#runPill"); if (p) p.textContent = st.progress + "% · " + st.elapsed + "s";
+}
+
+document.addEventListener("click", e => {
+  const t = e.target.closest("[data-split],[data-fc]");
+  if (t && t.dataset.split) { S.evalSplit = t.dataset.split; render(); }
+  if (t && t.dataset.fc) { S.fcTab = t.dataset.fc; render(); }
+});
+document.addEventListener("change", e => {
+  if (e.target.id === "evModel") { S.evalModel = e.target.value; render(); }
+  if (e.target.id === "msplit") { S.metricSplit = e.target.value; render(); }
+  if (e.target.id === "xRec") { S.xaiRec = +e.target.value; render(); }
+});
+$("#search").addEventListener("keydown", e => {
+  if (e.key !== "Enter") return;
+  const q = e.target.value.trim().toLowerCase(); if (!q) return;
+  const page = PAGES.find(p => p[1].toLowerCase().includes(q) || p[0].includes(q));
+  const alias = { shap: "xai", lime: "xai", arima: "forecast", sarima: "forecast", csv: "outputs", roc: "models", f1: "evaluation", auc: "evaluation", recommend: "retention", upload: "run" };
+  const hit = page ? page[0] : Object.keys(alias).find(k => q.includes(k)) ? alias[Object.keys(alias).find(k => q.includes(k))] :
+    (S.res && S.res.models.some(m => m.name.toLowerCase().includes(q))) ? "models" : null;
+  if (hit) { location.hash = hit; e.target.value = ""; } else toast(`No page matches “${q}”`);
+});
+$("#burger").onclick = () => $("#sidebar").classList.toggle("open");
+$("#promoBtn").onclick = () => location.hash = "run";
+$("#bell").onclick = () => { $("#bellDot").hidden = true; toast(S.res ? `Last run: ${S.res.meta.app_run_at} · best model ${S.res.meta.best}` : "No notifications yet"); };
+window.addEventListener("hashchange", go);
+
+(async function init() {
+  buildNav();
+  try { S.cfg = await api("/api/config"); } catch (e) { }
+  try { S.res = await api("/api/results"); } catch (e) { }
+  await refreshStatus();
+  go();
+  if (running()) startPolling();
+})();
